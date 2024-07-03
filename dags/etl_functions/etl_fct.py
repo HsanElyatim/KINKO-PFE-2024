@@ -1,5 +1,5 @@
 from airflow.hooks.base_hook import BaseHook
-from sqlalchemy import create_engine, Table, Column, Integer, String, Float, MetaData, ForeignKey, select, insert
+from sqlalchemy import create_engine, Table, Column, Integer, String, Float, MetaData, ForeignKey, select, insert, text
 import pandas as pd
 import re
 from airflow.models import Variable
@@ -80,7 +80,7 @@ def standardize_hotel_name_column(tbl_name, df, map_df):
     for value in df['name']:
         # Find the standardized value from map_df
         standardized_value = map_df.loc[
-            map_df[f"{tbl_name}_hotel_name"] == value, 'hotel_name_ref(Trip Advisor)'].values
+            map_df[f"{tbl_name[:-4]}_hotel_name"] == value, 'hotel_name_ref(Trip Advisor)'].values
         if len(standardized_value) > 0:
             standardized_values.append(standardized_value[0])
         else:
@@ -111,6 +111,34 @@ def extract_data_from_src_table(table):
     return pd.read_sql(f"SELECT * FROM {table}", engine)
 
 
+def get_src_tables():
+    """
+    Retrieves a list of table names from the database that end with '_src'.
+
+    Returns:
+    list: A list of table names that end with '_src'.
+    """
+    # Get the database connection details
+    conn = BaseHook.get_connection(db_name)
+
+    # Create the connection string for the PostgreSQL database
+    engine = create_engine(f'postgresql://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}')
+
+    # Query the information schema to get table names ending with '_src'
+    query = text("""
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name LIKE '%_src'
+    """)
+
+    # Execute the query and fetch the results
+    with engine.connect() as connection:
+        result = connection.execute(query)
+        src_tables = [row['table_name'] for row in result.fetchall()]
+
+    return src_tables
+
+
 def extract(**kwargs):
     """
         Extracts data from multiple source tables and returns a dictionary of DataFrames.
@@ -121,11 +149,12 @@ def extract(**kwargs):
         Returns:
         dict: A dictionary where the keys are table names and the values are DataFrames containing the extracted data from each table.
     """
-    tables = ['traveltodo_src', 'libertavoyages_src', 'tunisiebooking_src', 'agoda_src']
+    src_tables = get_src_tables()
+    print(src_tables)
     all_data = {}
 
     # Iterate over each table name
-    for table in tables:
+    for table in src_tables:
         # Extract data from the current table and store it in the dictionary
         all_data[table] = extract_data_from_src_table(table)
     return all_data
@@ -151,9 +180,9 @@ def transform_data(table, df):
     engine = create_engine(f'postgresql://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}')
 
     # Read mapping DataFrames from PostgreSQL tables
-    hotel_name_map = pd.read_sql(f"SELECT * FROM {table}_hotel_name_mapping", engine)
-    room_type_map = pd.read_sql(f"SELECT * FROM {table}_room_type_mapping", engine)
-    pension_map = pd.read_sql(f"SELECT * FROM {table}_pension_mapping", engine)
+    hotel_name_map = pd.read_sql(f"SELECT * FROM {table[:-4]}_hotel_name_mapping", engine)
+    room_type_map = pd.read_sql(f"SELECT * FROM {table[:-4]}_room_type_mapping", engine)
+    pension_map = pd.read_sql(f"SELECT * FROM {table[:-4]}_pension_mapping", engine)
 
     print(f"Transforming DataFrame from table: {table}")
 
@@ -221,8 +250,8 @@ def load(**kwargs):
     # Merge all DataFrames into one DataFrame
     merged_df = pd.concat(transformed_data.values(), ignore_index=True)
 
-    # Load merged DataFrame into the database table 'merged_df'
-    merged_df.to_sql('merged_df', engine, if_exists='replace', index=False, chunksize=100000)
+    # Load merged DataFrame into the database table 'stg_table'
+    merged_df.to_sql('stg_table', engine, if_exists='replace', index=False, chunksize=100000)
 
 
 def get_or_create_dim_id(engine, table, value_column, value):
@@ -252,11 +281,27 @@ def get_or_create_dim_id(engine, table, value_column, value):
 
 
 def load_fact_table():
+    """
+        Loads data from a staging table into a fact table in a PostgreSQL data warehouse.
+
+        This function maps the staging table values to dimension table IDs and inserts
+        the resulting data into the fact table.
+
+        Parameters:
+        None
+
+        Returns:
+        None
+    """
+    # Get the database connection details
     conn = BaseHook.get_connection(db_name)
+    # Create the connection string for the PostgreSQL database
     engine = create_engine(f'postgresql://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}')
 
+    # Initialize SQLAlchemy MetaData object
     metadata = MetaData()
 
+    # Reflect dimension and fact tables from the database
     check_in_dim = Table('check_in_dim', metadata, autoload_with=engine)
     extracted_at_dim = Table('extracted_at_dim', metadata, autoload_with=engine)
     location_dim = Table('location_dim', metadata, autoload_with=engine)
@@ -265,13 +310,17 @@ def load_fact_table():
     room_dim = Table('room_dim', metadata, autoload_with=engine)
     pension_dim = Table('pension_dim', metadata, autoload_with=engine)
     fact_table = Table('fact_table', metadata, autoload_with=engine)
-
     staging_table = Table('stg_table', metadata, autoload_with=engine)
 
     # Extract data from the staging table
     with engine.connect() as connection:
         result = connection.execute(select([staging_table]))
         df = pd.DataFrame(result.fetchall(), columns=result.keys())
+
+    # Fill null values in standardized columns with the original values
+    df['standardized_name'].fillna(df['name'], inplace=True)
+    df['standardized_room_type'].fillna(df['room_type'], inplace=True)
+    df['standardized_pension'].fillna(df['pension'], inplace=True)
 
     # Map values to dimension IDs and create the fact table DataFrame
     fact_df = pd.DataFrame()
@@ -283,13 +332,16 @@ def load_fact_table():
     fact_df['source_id'] = df['name'].apply(lambda x: get_or_create_dim_id(engine, source_dim, 'name', x))
     fact_df['hotel_id'] = df['standardized_name'].apply(
         lambda x: get_or_create_dim_id(engine, hotel_dim, 'standardized_name', x))
+    fact_df['stars_id'] = df['stars'].apply(
+        lambda x: get_or_create_dim_id(engine, pension_dim, 'standardized_pension', x))
     fact_df['room_id'] = df['standardized_room_type'].apply(
         lambda x: get_or_create_dim_id(engine, room_dim, 'standardized_room_type', x))
     fact_df['pension_id'] = df['standardized_pension'].apply(
         lambda x: get_or_create_dim_id(engine, pension_dim, 'standardized_pension', x))
+
     fact_df['price'] = df['price']
     fact_df['annulation'] = df['annulation']
-    fact_df['availabilty'] = df['availabilty']
+    fact_df['availability'] = df['availability']
 
     # Load data into the fact table
     with engine.connect() as connection:

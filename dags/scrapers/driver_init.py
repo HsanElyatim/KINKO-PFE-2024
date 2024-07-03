@@ -4,6 +4,12 @@ from selenium.webdriver.firefox.options import Options
 
 
 def init_firefox_driver():
+    """
+        Initializes a headless Firefox WebDriver with specific options for scraping.
+
+        Returns:
+            WebDriver: Initialized Firefox WebDriver instance.
+    """
     # Set up Firefox options
     firefox_options = Options()
     firefox_options.add_argument("--headless")  # Run in headless mode

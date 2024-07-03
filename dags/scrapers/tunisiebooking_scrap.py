@@ -225,6 +225,7 @@ def scrap(destination, check_in, check_out):
 
             flattened_hotels_info = [item for sublist in hotels_info for item in sublist]
             df = pd.DataFrame(flattened_hotels_info)
+            df['destination'] = destination
             df['check_in'] = check_in
             df['extracted_at'] = datetime.today().date()
 

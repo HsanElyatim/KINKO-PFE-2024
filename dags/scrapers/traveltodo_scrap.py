@@ -17,12 +17,34 @@ db_name = Variable.get("DB_NAME")
 
 
 def select_destination(driver, search_form, destination):
+    """
+        Selects the destination in the search form on the webpage.
+
+        Parameters:
+            driver (WebDriver): The WebDriver instance.
+            search_form (WebElement): The search form WebElement.
+            destination (str): The destination city or location to select.
+
+        Returns:
+            None
+    """
     try:
+        # Locate the destination input container
         destination_input_container = search_form.find_element(By.CLASS_NAME, "destination")
+
+        # Find the destination input field within the container
         destination_input = destination_input_container.find_element(By.ID, "locality")
+
+        # Send keys to the destination input field
         destination_input.send_keys(destination)
+
+        # Wait for the destination list container to appear
         destination_list_container = destination_input_container.find_element(By.CLASS_NAME, "tt-dataset-destination")
+
+        # Find all destination list items
         destination_list = destination_list_container.find_elements(By.CLASS_NAME, "tt-suggestion")
+
+        # Click on the first suggestion in the destination list
         driver.execute_script("arguments[0].click();", destination_list[0])
     except (NoSuchElementException, ElementNotInteractableException):
         print("Error selecting destination!")
@@ -253,6 +275,17 @@ def extract_all_hotels_info(driver):
 
 
 def scrap(destination, check_in, check_out):
+    """
+        Scrapes Travel To Do website for hotels information based on the provided destination, check-in, and check-out dates.
+
+        Parameters:
+            destination (str): The destination city or location.
+            check_in (datetime.date): The check-in date.
+            check_out (datetime.date): The check-out date.
+
+        Returns:
+            None
+    """
     driver = init_firefox_driver()
 
     print(f"Scraping Travel To Do for hotels in {destination}")
@@ -278,6 +311,7 @@ def scrap(destination, check_in, check_out):
 
             flattened_hotels_info = [item for sublist in hotels_info for item in sublist]
             df = pd.DataFrame(flattened_hotels_info)
+            df['destination'] = destination
             df['check_in'] = check_in
             df['extracted_at'] = datetime.today().date()
 

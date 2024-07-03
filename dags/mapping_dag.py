@@ -3,12 +3,11 @@ from airflow.operators.python_operator import PythonOperator
 from airflow import DAG
 from airflow.hooks.base_hook import BaseHook
 from airflow.models import Variable
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from fuzzywuzzy import process
 import re
 import pandas as pd
 import requests
-
 
 db_name = Variable.get("DB_NAME")
 TRIP_ADVISOR_API_KEY = Variable.get("TRIP_ADVISOR_API_KEY")
@@ -21,13 +20,58 @@ def clean_string(string):
     return string
 
 
+def get_src_tables():
+    """
+    Retrieves a list of table names from the database that end with '_src'.
+
+    Returns:
+    list: A list of table names that end with '_src'.
+    """
+    # Get the database connection details
+    conn = BaseHook.get_connection(db_name)
+
+    # Create the connection string for the PostgreSQL database
+    engine = create_engine(f'postgresql://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}')
+
+    # Query the information schema to get table names ending with '_src'
+    query = text("""
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name LIKE '%_src'
+    """)
+
+    # Execute the query and fetch the results
+    with engine.connect() as connection:
+        result = connection.execute(query)
+        src_tables = [row['table_name'] for row in result.fetchall()]
+
+    return src_tables
+
+
 def create_column_mapping_table(engine, table_name, column_name, reference_list, threshold=90):
+    """
+        Creates a mapping table for a specific column in a database table, mapping values to standardized values
+        based on a reference list using fuzzy matching.
+
+        Parameters:
+        - engine (sqlalchemy.engine.Engine): SQLAlchemy engine object for database connection.
+        - table_name (str): Name of the source table from which data is read.
+        - column_name (str): Name of the column in the source table to be standardized.
+        - reference_list (list): List of reference values for fuzzy matching.
+        - threshold (int, optional): Minimum score threshold (0-100) for fuzzy matching. Defaults to 90.
+
+        Returns:
+        None
+    """
+    # Query data from the source table
     query = f"SELECT * FROM {table_name};"
     df = pd.read_sql(query, engine)
 
+    # Clean and drop duplicates from the column of interest
     df[column_name] = df[column_name].apply(clean_string)
     df_unique = df.drop_duplicates(subset=[column_name])
 
+    # Perform fuzzy matching and create standardized values
     standardized_values = []
     for value in df_unique[column_name]:
         best_match = process.extractOne(value, reference_list)
@@ -38,6 +82,7 @@ def create_column_mapping_table(engine, table_name, column_name, reference_list,
 
         standardized_values.append(standardized_value)
 
+    # Create a DataFrame with original and standardized values
     df_unique[column_name + '_standardized'] = standardized_values
 
     df_unique[[column_name, f"{column_name}_standardized"]].to_sql(f'{table_name}_{column_name}_mapping', engine,
@@ -45,12 +90,21 @@ def create_column_mapping_table(engine, table_name, column_name, reference_list,
 
 
 def create_column_mapping_tables():
-    table_names = ['traveltodo_src', 'libertavoyages_src', 'tunisiebooking_src', 'agoda_src']
+    """
+        Creates column mapping tables for 'room_type' and 'pension' columns across all source tables.
+
+        Parameters:
+        None
+
+        Returns:
+        None
+    """
+    table_names = get_src_tables()
 
     conn = BaseHook.get_connection(db_name)
     engine = create_engine(f'postgresql://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}')
 
-    query = "SELECT * FROM traveltodo ;"
+    query = "SELECT * FROM traveltodo_src ;"
     traveltodo_df = pd.read_sql(query, engine)
 
     traveltodo_pensions_ref = list(traveltodo_df.pension.unique())
@@ -62,6 +116,15 @@ def create_column_mapping_tables():
 
 
 def augment_hotel_info(row):
+    """
+    Augments hotel information by fetching additional data using TripAdvisor API.
+
+    Parameters:
+    - row (pd.Series): Row containing 'name' and 'destination' of the hotel.
+
+    Returns:
+    - str: Reference name ('ref_name') from TripAdvisor API, or None if data not found.
+    """
     res = search_by_hotel_name_and_destination(TRIP_ADVISOR_API_KEY, row['name'], row['destination'])
     if res is None:
         return None
@@ -69,6 +132,17 @@ def augment_hotel_info(row):
 
 
 def search_by_hotel_name_and_destination(API_KEY, name, destination):
+    """
+        Search for hotel information using the TripAdvisor API.
+
+        Parameters:
+        - API_KEY (str): Your TripAdvisor API key.
+        - name (str): Name of the hotel to search.
+        - destination (str): Destination where the hotel is located.
+
+        Returns:
+        - Dictionary containing additional information about the hotel, or None if not found.
+    """
     url = f"https://api.content.tripadvisor.com/api/v1/location/search?key={API_KEY}&searchQuery={name}&category=hotels&address={destination}&language=en"
     headers = {"accept": "application/json"}
 
@@ -102,7 +176,7 @@ def create_hotel_name_mapping_table(table_name):
 
 
 def create_hotel_name_mapping_tables():
-    table_names = ['libertavoyages_src', 'traveltodo_src', 'tunisiebooking_src', 'agoda_src']
+    table_names = get_src_tables()
 
     for table_name in table_names:
         create_hotel_name_mapping_table(table_name)
